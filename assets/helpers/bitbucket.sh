@@ -54,6 +54,7 @@ bitbucket_request() {
   fi
 
   curl_cmd="curl -s --netrc-file \"$netrc_file\" $extra_options \"$request_url\" > \"$request_result\""
+
   if ! eval $curl_cmd; then
     log "Bitbucket request $request_url failed"
     exit 1
@@ -93,6 +94,18 @@ bitbucket_pullrequest() {
   # $6: skip ssl verification
   log "Retrieving pull request #$4 for $2/$3"
   bitbucket_request "$1" "projects/$2/repos/$3/pull-requests/$4" "" "" "" "$6" "$5"
+}
+
+bitbucket_pullrequests() {
+  # $1: host
+  # $2: project
+  # $3: repository id
+  # $4: state
+  # $5: netrc file (default: $HOME/.netrc)
+  # $6: skip ssl verification
+  local state=${4:-all}
+  log "Retrieving pull requests for $2/$3 for $state states"
+  bitbucket_request "$1" "projects/$2/repos/$3/pull-requests" "state=$state" "" "" "$6" "$5"
 }
 
 bitbucket_pullrequest_merge() {

@@ -46,6 +46,7 @@ disable_git_lfs=$(jq -r '(.params.disable_git_lfs // false)' < "$payload")
 
 prq_id=$(jq -r '.version.id // ""' < "$payload")
 prq_date=$(jq -r '.version.date // ""' < "$payload")
+prq_open=$(jq -r '.version.open // "true"' < "$payload")
 
 configure_git_ssl_verification "$skip_ssl_verification"
 configure_git_global "${git_config_payload}"
@@ -65,16 +66,70 @@ if test "$depth" -gt 0 2> /dev/null; then
   depthflag="--depth $depth"
 fi
 
-branch="pull-requests/${prq_id}/merge"
+# start process for retrieving pull request information
+log "Calculating repository specifics"
+# determine repository name for calling REST api
+repo_name=$(basename "$uri" | sed "s/.git$//")
+repo_project=$(basename $(dirname "$uri"))
+# parse uri and retrieve host
+uri_parser "$uri"
+repo_host="${uri_schema}://${uri_address}"
+repo_host=${repo_host}$(getBasePathOfBitbucket)
+
+# retrieve pullrequest data
+prq=$(bitbucket_pullrequest "$repo_host" "$repo_project" "$repo_name" "$prq_id" "" "$skip_ssl_verification")
+if [ "$prq" = "ERROR" ]; then
+  log "Unable to obtain pull request information $repo_host $repo_name $prq_id"
+fi
+prq=$(echo "$prq" | jq -c '.')
+prq_state=$(echo "$prq" | jq -r '.state')
+
+
+# calculate source and target commit
+source_commit=$(echo "$prq" | jq -r '.fromRef.latestCommit')
+target_commit=$(echo "$prq" | jq -r '.toRef.latestCommit')
+
 
 log "Cloning $uri in $destination"
 git clone $depthflag "$uri" "$destination"
 cd "$destination"
 
-git fetch $depthflag origin "+refs/${branch}:refs/remotes/origin/${branch}"
-git checkout -B $branch origin/$branch
 
-ref=$(git rev-parse HEAD)
+# Treat PRs differently for opened and closed ones
+# For opened PRs, we can clone the repository
+#    If auto-mergeable, use the merged branch
+#    Else, use the source branch
+# For closed PRs, we treat the following states differently (either DECLINED or MERGED; OPEN should be part of the previous decision path)
+#    For DECLINED PRs, use the PR target branch. We cannot assume that the source branch is reachable (might be protected). The pullrequest/from branch would already have been removed.  Issue warning that cloned branch is the original target branch.
+#    For MERGED PRs, use the PR source commit to find it's parent. tHe parent is assumed to be the auto merged branch.
+if [[ "$prq_open" == "true" ]]; then
+  # PR branch would still exist
+  # Looks like this implementation assumes this PR is mergeable
+  branch="pull-requests/${prq_id}/merge"
+  git fetch $depthflag origin "+refs/${branch}:refs/remotes/origin/${branch}"
+  git checkout -B $branch origin/$branch
+  ref=$(git rev-parse HEAD)
+else
+  # If PR is closed, we would not have a proper ref to the branch, use commit id instead
+  # Following the above, this implementation assume this PR is mergeable
+
+  # when PR is closed, we checked if it has been merged
+  if [[ "$prq_state" != "MERGED" ]]; then
+    log "Pull Request has been closed and is also not merged. We cannot clone the source commit as permission might not be granted on the source side. Using target commit for source and reference commits."
+    source_commit=$target_commit
+    ref=$source_commit
+    git fetch $depthflag origin
+    git checkout -B $source_commit $source_commit
+  else
+    log "Pull Request has been closed but has been merged. Using commit id instead of branch names to retrieve reference commit."
+    git fetch $depthflag origin
+    # the child of the commit is the merge commit
+    ref=$(git rev-list --all --not ${source_commit:0:7}^@ --children | grep "^${source_commit:0:7}" | awk '{print $2}')
+    git checkout -B $ref $ref
+  fi
+fi
+log "Checked out $ref"
+
 
 invalid_key() {
   echo "Invalid GPG key in: ${commit_verification_keys}"
@@ -118,19 +173,20 @@ if [ "$disable_git_lfs" != "true" ]; then
   git submodule foreach "git lfs fetch && git lfs checkout"
 fi
 
-# calculate source and target commit
-source_commit=$(git rev-list --parents -1 $ref | awk '{print $3}')
-target_commit=$(git rev-list --parents -1 $ref | awk '{print $2}')
 
-if [ -z "$source_commit" ]; then
-  log "Unable to determine source commit from merge commit $ref. Please verify depth configuration."
-  exit 1
-fi
 
-if [ -z "$target_commit" ]; then
-  log "Unable to determine target commit from merge commit $ref. Please verify depth configuration."
-  exit 1
-fi
+# include ATC_EXTERNAL_URL in build status key, different sources should have different builds
+build_key="$BUILD_TEAM_NAME-$BUILD_PIPELINE_NAME-$BUILD_JOB_NAME-$ATC_EXTERNAL_URL"
+build_name="Concourse $BUILD_TEAM_NAME: $BUILD_PIPELINE_NAME - $BUILD_JOB_NAME - #$BUILD_NAME"
+build_url="$ATC_EXTERNAL_URL/teams/$BUILD_TEAM_NAME/pipelines/$BUILD_PIPELINE_NAME/jobs/$BUILD_JOB_NAME/builds/$BUILD_NAME"
+build_description="Concourse build for PRQ #$prq_id @ $ATC_EXTERNAL_URL"
+build_data=$(jq -cn "{
+  key: \"$build_key\",
+  name: \"$build_name\",
+  url: \"$build_url\",
+  description: \"$build_description\",
+  number: \"$BUILD_NAME\"
+}")
 
 # expose configuration of pull request that can be used in container
 git config --add pullrequest.id $prq_id
@@ -138,6 +194,8 @@ git config --add pullrequest.source $source_commit
 git config --add pullrequest.target $target_commit
 git config --add pullrequest.merge $ref
 git config --add pullrequest.date "$prq_date"
+git config --add pullrequest.prdata "$prq"             # use quotes to ensure proper escape of characters
+git config --add pullrequest.builddata "$build_data"
 
 jq -n "{
   version: $(jq '.version' < "$payload"),

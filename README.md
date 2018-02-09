@@ -63,6 +63,12 @@ It will accept a regular expression as determined by [egrep](http://linuxcommand
 
 * `only_when_asked`: *Optional (default: false).* Only build pull request when explicitly asked for, using rebuild_phrase.
 
+* `only_match_title`: *Optional.* Only build pull request when title matches the provided _regex expression_.
+
+* `only_when_open`: *Optional (default: false).* Only triggers when the state of the pull request is marked as *OPEN*. Works only with `only_match_title`.
+
+* `only_when_closed`: *Optional (default: false).* Only triggers when the state of the pull request is marked as *CLOSED* (MERGED/DECLINED). Works only with `only_match_title`.
+
 * `rebuild_when_target_changed`: *Optional (default: false).* Rebuild pull requests when target branch changed instead of only when source branch changed.
 
 * `rebuild_phrase`: *Optional (default: test this please).* Regular expression as determined by [egrep](http://linuxcommand.org/man_pages/egrep1.html) will match all comments in pull request overview.
@@ -108,6 +114,18 @@ Set the status message on specified pull request.
 * `status`: *Required.* The status of success, failure or pending.
 
   * [`on_success`](https://concourse.ci/on-success-step.html) and [`on_failure`](https://concourse.ci/on-failure-step.html) triggers may be useful for you when you wanted to reflect build result to the pull request (see the example below).
+
+
+### Pull Request and Build Information
+
+The pull request and pipeline build information can be found in the folder containing the source of the pull request (in json format).
+
+You can use the following command to extract the information:
+
+```
+pr_data=$(git config --get pullrequest.prdata | cat)
+build_data=$(git config --get pullrequest.builddata | cat)
+```
 
 ## Example pipeline
 
@@ -155,4 +173,68 @@ jobs:
       params:
         path: pullrequest
         status: failure
+```
+
+
+## Only trigger on OPEN/CLOSED states
+
+The `only_when_open` and `only_when_closed` options will change the behavior of `check` to request information from all pull requests that has been created, in order to detect closed pull requests.
+
+Check will return a version that contains only `pull request id`, `open status` and `pull request updated date`.
+
+The other option that makes sense and will work with the above options are:
+
+* `only_match_title`: *Optional.* Only build pull request when title matches the provided _regex expression_.
+
+### Example pipeline
+
+```yaml
+resource_types:
+- name: concourse-bitbucket-pullrequest
+  type: docker-image
+  source:
+    repository: laurentverbruggen/concourse-bitbucket-pullrequest-resource
+
+resources:
+- name: pullrequest
+  type: concourse-bitbucket-pullrequest
+  source:
+    username: {{bitbucket-username}}
+    password: {{bitbucket-password}}
+    uri: laurentverbruggen/concourse-bitbucket-pullrequest-resource
+    only_when_closed: true
+
+- name: handle-closed-pullrequest
+  public: true
+  serial: true
+  plan:
+  - get: pullrequest
+    trigger: true
+    version: every
+  - task: configure
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source:
+          repository: digitalgenius/alpine-jq-git
+      inputs:
+        - name: pullrequest
+      run:
+        path: bash
+        args:
+        - -excl
+        - |-
+          echo "A pullrequest has just been closed."
+
+          pushd guardrails-site-closed-pullrequest
+          pr_data=$(git config --get pullrequest.prdata | cat)
+          build_data=$(git config --get pullrequest.builddata | cat)
+          popd
+
+          echo "Pull Request Info:"
+          echo "$pr_data" | jq -r '.'
+
+          echo "Build Info:"
+          echo "$build_data" | jq -r '.'
 ```
