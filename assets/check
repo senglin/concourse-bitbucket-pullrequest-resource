@@ -37,8 +37,11 @@ only_for_branch=$(jq -r '.source.only_for_branch // "."' < "$payload")
 only_without_conflicts=$(jq -r '.source.only_without_conflicts // "true"' < "$payload")
 only_when_mergeable=$(jq -r '.source.only_when_mergeable // "false"' < "$payload")
 only_when_asked=$(jq -r '.source.only_when_asked // "false"' < "$payload")
+only_match_title=$(jq -r '.source.only_match_title // ""' < "$payload")
 rebuild_when_target_changed=$(jq -r '.source.rebuild_when_target_changed // "false"' < "$payload")
 rebuild_phrase=$(jq -r '.source.rebuild_phrase // "test this please"' < "$payload")
+only_when_closed=$(jq -r '.source.only_when_closed //false' < "$payload") # this includes the state in the version output
+only_when_open=$(jq -r '.source.only_when_open //false' < "$payload") # this includes the state in the version output
 
 configure_git_ssl_verification "$skip_ssl_verification"
 configure_git_global "${git_config_payload}"
@@ -48,90 +51,151 @@ if [ -z "$uri" ]; then
   exit 1
 fi
 
-# if option 'rebuild_when_target_changed' is enabled take merge branch since commit will always change for changes on target branch
-prq_branch="from"
-if [ "$rebuild_when_target_changed" == "true" ]; then
-  prq_branch="merge"
-fi
+log "Calculating repository specifics"
+# determine repository name for calling REST api
+repo_name=$(basename "$uri" | sed "s/.git$//")
+repo_project=$(basename $(dirname "$uri"))
 
-# collect all pull requests from uri
-pull_requests=$(git ls-remote "$uri" | grep -E "/pull\-requests/[0-9]+/${prq_branch}" | cat)
+# parse uri and retrieve host
+uri_parser "$uri"
+repo_host="${uri_schema}://${uri_address}"
+repo_host=${repo_host}$(getBasePathOfBitbucket)
 
+# if option 'only_trigger_when_opened_closed' is enabled, use api to retrieve all PRs (even closed ones) and output them
+# this action precedes all other functionalities
 versions="[]"
-if [ -n "$pull_requests" ]; then
-  log "Calculating repository specifics"
-  # determine repository name for calling REST api
-  repo_name=$(basename "$uri" | sed "s/.git$//")
-  repo_project=$(basename $(dirname "$uri"))
+if [[ ("$only_when_open" == "true")  || ("$only_when_closed" == "true") ]]; then
+    # verify target branch of prq
+    prqs=$(bitbucket_pullrequests "$repo_host" "$repo_project" "$repo_name" "all" "" "$skip_ssl_verification")
 
-  # parse uri and retrieve host
-  uri_parser "$uri"
-  repo_host="${uri_schema}://${uri_address}"
+    if [ "$prqs" = "ERROR" ]; then
+      log "Cannot fetch pull requests"
+      exit 1
+    fi
 
-  repo_host=${repo_host}$(getBasePathOfBitbucket)
+    # What is returned is an array.  Unpack it into individual lines.
+    prqs=$(echo "$prqs" | jq -c '.[]')
+
+    if [ -n "$prqs" ]; then
+      while read -r prq ; do
+        prq_number=$(echo "$prq" | jq -c '.id')
+        prq_open=$(echo "$prq" | jq -c '.open')
+        prq_change=$(echo "$prq" | jq -c '.updatedDate // null')  # ascending. list the PR that has been changed first
+        prq_title=$(echo "$prq" | jq -r '.title')
+
+        # support filtering of titles
+        if [[ ("$prq_title" != "") && (! "$prq_title" =~ $only_match_title) ]]; then
+          log "Skipping PRQ #$prq_number since doesn't match expected title"
+          continue
+        fi
+
+        # skip 'open' PR
+        if [[ ("$only_when_open" == "false") && ("$prq_open" == "true") ]]; then
+          log "Skipping open PRQ #$prq_number"
+          continue
+        fi
+
+        # skip 'closed' PR
+        if [[ ("$only_when_closed" == "false") && ("$prq_open" == "false") ]]; then
+          log "Skipping closed PRQ #$prq_number"
+          continue
+        fi
+
+        versions+=" + [{id: \"$prq_number\", open: \"$prq_open\", change: $prq_change}]"
+      done <<< "$prqs"
+    fi
+
+else
+
+  # if option 'rebuild_when_target_changed' is enabled take merge branch since commit will always change for changes on target branch
+  prq_branch="from"
+  if [ "$rebuild_when_target_changed" == "true" ]; then
+    prq_branch="merge"
+  fi
+
+  # collect all pull requests from uri
+  pull_requests=$(git ls-remote "$uri" | grep -E "/pull\-requests/[0-9]+/${prq_branch}" | cat)
 
   versions="[]"
-  while read pull_request ; do
-    log "Verifying pull request"
-    # determine hash and prq number from grep
-    prq_number=$(echo "$pull_request" | sed -E "s/^.*\/pull-requests\/([0-9]+)\/.*$/\\1/")
-    prq_hash=$(echo "$pull_request" | awk '{print $1}')
+  if [ -n "$pull_requests" ]; then
+    while read pull_request ; do
+      log "Verifying pull request"
+      # determine hash and prq number from grep
+      prq_number=$(echo "$pull_request" | sed -E "s/^.*\/pull-requests\/([0-9]+)\/.*$/\\1/")
 
-    # verify target branch of prq
-    prq=$(bitbucket_pullrequest "$repo_host" "$repo_project" "$repo_name" "$prq_number" "" "$skip_ssl_verification")
+      # verify target branch of prq
+      prq=$(bitbucket_pullrequest "$repo_host" "$repo_project" "$repo_name" "$prq_number" "" "$skip_ssl_verification")
 
-    if [ "$prq" = "ERROR" ]; then
-      continue
-    fi
-
-    log "Pull request #${prq_number}"
-
-    prq_to_branch=$(echo "$prq" | jq -r '.toRef.displayId')
-    if [[ "$prq_to_branch" =~ $only_for_branch ]]; then
-
-      if [ "$only_when_mergeable" == "true" -o "$only_without_conflicts" == "true" ]; then
-        prq_merge=$(bitbucket_pullrequest_merge "$repo_host" "$repo_project" "$repo_name" "$prq_number" "" "$skip_ssl_verification")
-
-        # verify if prq has merge conflicts
-        conflicted=$(echo "$prq_merge" | jq -r '.conflicted')
-        if [ "$conflicted" == "true" -a "$only_without_conflicts" == "true" ]; then continue; fi
-
-        # verify if prq is mergeable (e.g. enough approvals, tasks done, ...)
-        mergeable=$(echo "$prq_merge" | jq -r '.canMerge')
-        if [ "$mergeable" == "false" -a "$only_when_mergeable" == "true" ]; then continue; fi
+      if [ "$prq" = "ERROR" ]; then
+        continue
       fi
 
-      # edit timestamp to version to force new build when rebuild_phrase is included in comments
-      prq_verify_date=$(echo "$prq" | jq -r '.createdDate')
-      skip_build=false
-      comments=$(bitbucket_pullrequest_overview_comments "$repo_host" "$repo_project" "$repo_name" "$prq_number" "" "$skip_ssl_verification" | jq -c '.[]')
-      if [ -n "$comments" ]; then
-        while read -r comment; do
-          text=$(echo "$comment" | jq -r '.text')
+      log "Pull request #${prq_number}"
 
-          # check for progress or finished messages => do not include in versions when available
-          if bitbucket_pullrequest_progress_commit_match "$text" "$prq_hash"; then
-            log "Skipping PRQ #$prq_number since already handled"
-            skip_build=true
-            break
-          fi
-
-          # edit timestamp to force new build when rebuild_phrase is included in comments
-          if echo "$text" | grep -Ec "$rebuild_phrase" > /dev/null; then
-            prq_verify_date=$(echo "$comment" | jq -r '.createdDate')
-            break
-          fi
-        done <<< "$comments"
+      # if we are looking at the 'from' branches, take the latest commit from the api, rather than ls-remote, to avoid race conditions
+      if [ "$prq_branch" == "from" ]; then
+        prq_hash=$(echo "$prq" | jq -r '.fromRef.latestCommit')
+      else
+        # commit taken from ls-remote
+        # this is the only information taken from ls-remote (auto merge branch info is not available from the pullrequest api (you have to perform a diff commit between the MERGE & FROM refs))
+        prq_hash=$(echo "$pull_request" | awk '{print $1}')
       fi
 
-      # add prq to versions
-      if [ "$skip_build" == "false" ]; then
-        pretty_date=$(date_from_epoch_seconds "$(( ($prq_verify_date + 500) / 1000))")
-        versions+=" + [{ id: \"$prq_number\", hash: \"$prq_hash\", date: \"$pretty_date\", change: $prq_verify_date }]"
-      fi
+      prq_to_branch=$(echo "$prq" | jq -r '.toRef.displayId')
+      prq_title=$(echo "$prq" | jq -r '.title')
+      if [[ "$prq_to_branch" =~ $only_for_branch ]]; then
 
-    fi
-  done <<< "$pull_requests"
+        if [[ ("$prq_title" != "") && (! "$prq_title" =~ $only_match_title) ]]; then
+          log "Skipping PRQ #$prq_number since doesn't match expected title"
+          continue
+        fi
+
+        if [ "$only_when_mergeable" == "true" -o "$only_without_conflicts" == "true" ]; then
+          prq_merge=$(bitbucket_pullrequest_merge "$repo_host" "$repo_project" "$repo_name" "$prq_number" "" "$skip_ssl_verification")
+
+          # verify if prq has merge conflicts
+          conflicted=$(echo "$prq_merge" | jq -r '.conflicted')
+          if [ "$conflicted" == "true" -a "$only_without_conflicts" == "true" ]; then continue; fi
+
+          # verify if prq is mergeable (e.g. enough approvals, tasks done, ...)
+          mergeable=$(echo "$prq_merge" | jq -r '.canMerge')
+          if [ "$mergeable" == "false" -a "$only_when_mergeable" == "true" ]; then continue; fi
+        fi
+
+        # edit timestamp to version to force new build when rebuild_phrase is included in comments
+        prq_verify_date=$(echo "$prq" | jq -r '.updatedDate')
+        skip_build=false
+        comments=$(bitbucket_pullrequest_overview_comments "$repo_host" "$repo_project" "$repo_name" "$prq_number" "" "$skip_ssl_verification" | jq -c '.[]')
+        if [ -n "$comments" ]; then
+          while read -r comment; do
+            text=$(echo "$comment" | jq -r '.text')
+
+            # check for progress or finished messages => do not include in versions when available
+            if bitbucket_pullrequest_progress_commit_match "$text" "$prq_hash"; then
+              log "Skipping PRQ #$prq_number since already handled"
+              skip_build=true
+              break
+            fi
+
+            # edit timestamp to force new build when rebuild_phrase is included in comments
+            if echo "$text" | grep -Ec "$rebuild_phrase" > /dev/null; then
+              prq_verify_date=$(echo "$comment" | jq -r '.createdDate')   #this is the creation date of the comment
+              log "$comment"
+              break
+            fi
+          done <<< "$comments"
+        fi
+
+        # add prq to versions
+        if [ "$skip_build" == "false" ]; then
+          pretty_date=$(date_from_epoch_seconds "$(( ($prq_verify_date + 500) / 1000))")
+          versions+=" + [{id: \"$prq_number\", hash: \"$prq_hash\", date: \"$pretty_date\", change: $prq_verify_date}]"
+        fi
+
+      fi
+    done <<< "$pull_requests"
+  fi
+
 fi
 
 jq -n "$versions | sort_by(.change) | map(del(.change))"  >&3
