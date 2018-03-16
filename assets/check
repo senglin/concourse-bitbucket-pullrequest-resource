@@ -22,6 +22,7 @@ PATH=/usr/local/bin:$PATH
 payload=$(tmpfile request)
 
 cat > "$payload" <&0
+log "PAYLOAD $(jq -r '. | .source.password="<redacted>" // ""' < "$payload")"
 
 log "Configuring git credentials"
 load_pubkey "$payload"

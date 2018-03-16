@@ -10,6 +10,8 @@ ASSETS=$(cd "$(dirname "$0")" && pwd)
 source $ASSETS/helpers/git.sh
 source $ASSETS/helpers/utils.sh
 source $ASSETS/helpers/bitbucket.sh
+# supports input file specified by https://github.com/swce/keyval-resource
+#source $ASSETS/helpers/keyvaluein.sh
 
 # for all temporary files in 'check'
 tmpfile() {
@@ -29,6 +31,7 @@ PATH=/usr/local/bin:$PATH
 payload=$(tmpfile request)
 
 cat > "$payload" <&0
+log "PAYLOAD $(jq -r '. | .source.password="<redacted>" // ""' < "$payload")"
 
 load_pubkey "$payload"
 configure_credentials "$payload"
@@ -201,6 +204,10 @@ git config --add pullrequest.prdata "$prq"             # use quotes to ensure pr
 log "pullrequest.pr_data    : $prq"
 git config --add pullrequest.builddata "$build_data"
 log "pullrequest.build_data : $build_data"
+
+
+# supports output file specified by https://github.com/swce/keyval-resource
+#source $ASSETS/helpers/keyvalueout.sh
 
 jq -n "{
   version: $(jq '.version' < "$payload"),

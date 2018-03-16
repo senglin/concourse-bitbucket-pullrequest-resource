@@ -29,6 +29,7 @@ PATH=/usr/local/bin:$PATH
 payload=$(tmpfile request)
 
 cat > "$payload" <&0
+log "PAYLOAD $(jq -r '. | .source.password="<redacted>" // ""' < "$payload")"
 
 load_pubkey "$payload"
 configure_credentials "$payload"
